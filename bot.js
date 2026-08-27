@@ -2,156 +2,298 @@ require("dotenv").config();
 
 const express = require("express");
 const TelegramBot = require("node-telegram-bot-api");
-const axios = require("axios"); // 🔥 1. Cần cài thêm thư viện axios: npm install axios
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
-const bot = new TelegramBot(process.env.BOT_TOKEN, {
+// ================================
+// ENVIRONMENT VARIABLES
+// ================================
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
+const WEBSITE_API_URL = process.env.WEBSITE_API_URL;
+const INTERNAL_SECRET_TOKEN = process.env.INTERNAL_SECRET_TOKEN;
+
+const ADMIN_IDS = (process.env.ADMIN_IDS || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean)
+    .map((id) => Number(id))
+    .filter((id) => Number.isInteger(id));
+
+if (!BOT_TOKEN) {
+    console.error("❌ Thiếu biến môi trường BOT_TOKEN");
+    process.exit(1);
+}
+
+if (!ADMIN_CHAT_ID) {
+    console.error("❌ Thiếu biến môi trường ADMIN_CHAT_ID");
+    process.exit(1);
+}
+
+if (!WEBSITE_API_URL) {
+    console.error("❌ Thiếu biến môi trường WEBSITE_API_URL");
+    process.exit(1);
+}
+
+if (!INTERNAL_SECRET_TOKEN) {
+    console.error("❌ Thiếu biến môi trường INTERNAL_SECRET_TOKEN");
+    process.exit(1);
+}
+
+if (ADMIN_IDS.length === 0) {
+    console.error("❌ Thiếu ADMIN_IDS. Không khởi động bot để tránh người lạ có thể duyệt đơn.");
+    process.exit(1);
+}
+
+const bot = new TelegramBot(BOT_TOKEN, {
     polling: true
 });
 
-// 🔥 2. Danh sách ID Telegram của Admin được phép bấm duyệt (lấy từ .env hoặc khai báo mảng)
-const ADMIN_IDS = process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(",").map(id => Number(id.trim())) : [];
+function escapeHtml(value) {
+    return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
 
 // ==========================================
-// 1. ROUTE TẠO ĐƠN & GỬI NÚT DUYỆT SANG TELEGRAM
+// 1. TẠO ĐƠN -> GỬI THÔNG BÁO TELEGRAM
 // ==========================================
 app.post("/api/create-order", async (req, res) => {
     try {
-        const { username, amount, orderId } = req.body;
+        const { username, amount, orderId } = req.body || {};
 
-        if (!username || !amount || !orderId) {
+        if (
+            username === undefined ||
+            username === null ||
+            String(username).trim() === "" ||
+            amount === undefined ||
+            amount === null ||
+            orderId === undefined ||
+            orderId === null ||
+            String(orderId).trim() === ""
+        ) {
             return res.status(400).json({
                 success: false,
                 message: "Thiếu thông tin đơn hàng"
             });
         }
 
+        const numericAmount = Number(amount);
+
+        if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+            return res.status(400).json({
+                success: false,
+                message: "Số tiền không hợp lệ"
+            });
+        }
+
+        const safeUsername = escapeHtml(String(username).trim());
+        const safeOrderId = escapeHtml(String(orderId).trim());
+
         const message = `💰 <b>CÓ ĐƠN NẠP TIỀN MỚI</b>
 
-👤 <b>User:</b> ${username}
-💵 <b>Số tiền:</b> ${Number(amount).toLocaleString("vi-VN")}đ
-🧾 <b>Mã đơn:</b> <code>${orderId}</code>
+👤 <b>User:</b> ${safeUsername}
+💵 <b>Số tiền:</b> ${numericAmount.toLocaleString("vi-VN")}đ
+🧾 <b>Mã đơn:</b> <code>${safeOrderId}</code>
 
 ⏳ <b>Trạng thái:</b> CHỜ THANH TOÁN`;
 
-        // 🔥 Chỉnh sửa: Thêm nút bấm Inline Keyboard
         await bot.sendMessage(
-            process.env.ADMIN_CHAT_ID,
+            ADMIN_CHAT_ID,
             message,
             {
                 parse_mode: "HTML",
                 reply_markup: {
                     inline_keyboard: [
                         [
-                            { text: "✅ Đồng ý", callback_data: `approve:${orderId}` },
-                            { text: "❌ Từ chối", callback_data: `reject:${orderId}` }
+                            {
+                                text: "✅ Đồng ý",
+                                callback_data: `approve:${String(orderId).trim()}`
+                            },
+                            {
+                                text: "❌ Từ chối",
+                                callback_data: `reject:${String(orderId).trim()}`
+                            }
                         ]
                     ]
                 }
             }
         );
 
-        res.json({
+        return res.json({
             success: true,
             message: "Đã gửi thông báo Telegram"
         });
-
     } catch (error) {
-        console.error(error);
+        console.error("❌ Lỗi /api/create-order:", error);
 
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
-            message: "Lỗi server"
+            message: "Không thể gửi thông báo Telegram"
         });
     }
 });
 
 // ==========================================
-// 🔥 2. BẮT SỰ KIỆN KHI ADMIN BẤM NÚT DUYỆT / TỪ CHỐI
+// 2. ADMIN BẤM DUYỆT / TỪ CHỐI
 // ==========================================
 bot.on("callback_query", async (query) => {
-    const userId = query.from.id;
-    const adminUsername = query.from.username || query.from.first_name;
-    const data = query.data; // Có dạng "approve:NAP123" hoặc "reject:NAP123"
+    const userId = query.from?.id;
+    const adminUsername =
+        query.from?.username ||
+        query.from?.first_name ||
+        `ID ${userId}`;
 
-    // Kiểm tra quyền Admin
-    if (ADMIN_IDS.length > 0 && !ADMIN_IDS.includes(userId)) {
-        return bot.answerCallbackQuery(query.id, {
-            text: "⛔ Bạn không có quyền duyệt đơn này!",
-            show_alert: true
-        });
+    const data = query.data || "";
+
+    // Phải trả lời callback để Telegram không treo nút loading.
+    try {
+        await bot.answerCallbackQuery(query.id);
+    } catch (error) {
+        console.error("⚠️ Không thể answerCallbackQuery:", error.message);
     }
 
-    const [action, orderId] = data.split(":");
+    // Chỉ Admin được phép thao tác.
+    if (!ADMIN_IDS.includes(userId)) {
+        try {
+            await bot.answerCallbackQuery(query.id, {
+                text: "⛔ Bạn không có quyền duyệt đơn này!",
+                show_alert: true
+            });
+        } catch (_) {}
+
+        return;
+    }
+
+    const separatorIndex = data.indexOf(":");
+    const action = separatorIndex >= 0 ? data.slice(0, separatorIndex) : "";
+    const orderId = separatorIndex >= 0 ? data.slice(separatorIndex + 1) : "";
 
     if (!["approve", "reject"].includes(action) || !orderId) {
-        return bot.answerCallbackQuery(query.id, { text: "Yêu cầu không hợp lệ!" });
+        try {
+            await bot.answerCallbackQuery(query.id, {
+                text: "⚠️ Yêu cầu không hợp lệ!",
+                show_alert: true
+            });
+        } catch (_) {}
+
+        return;
     }
 
-    await bot.answerCallbackQuery(query.id, { text: "Đang xử lý..." });
-
     try {
-        // Gửi request về API PHP trên Website để cập nhật DB và cộng tiền
-        const response = await axios.post(process.env.WEBSITE_API_URL, {
-            orderId: orderId,
-            action: action,
-            admin_username: adminUsername
-        }, {
+        const response = await fetch(WEBSITE_API_URL, {
+            method: "POST",
             headers: {
                 "Content-Type": "application/json",
-                "X-Internal-Token": process.env.INTERNAL_SECRET_TOKEN
-            }
+                "X-Internal-Token": INTERNAL_SECRET_TOKEN
+            },
+            body: JSON.stringify({
+                orderId,
+                action,
+                admin_username: adminUsername
+            })
         });
 
-        const resData = response.data;
+        let resData = {};
+        try {
+            resData = await response.json();
+        } catch (_) {
+            resData = {};
+        }
 
-        if (resData.success) {
-            const statusText = action === "approve" 
-                ? `✅ <b>ĐÃ DUYỆT & CỘNG TIỀN</b> (Bởi @${adminUsername})` 
-                : `❌ <b>ĐÃ TỪ CHỐI</b> (Bởi @${adminUsername})`;
+        if (!response.ok || !resData.success) {
+            const errorMessage =
+                resData.message ||
+                `Website API trả về HTTP ${response.status}`;
 
-            // Sửa lại tin nhắn cũ và ẨN NÚT BẤM để không bị bấm lại lần 2
+            console.error("❌ Website API:", response.status, resData);
+
+            try {
+                await bot.answerCallbackQuery(query.id, {
+                    text: `⚠️ ${errorMessage}`.slice(0, 200),
+                    show_alert: true
+                });
+            } catch (_) {}
+
+            return;
+        }
+
+        const safeAdminUsername = escapeHtml(adminUsername);
+
+        const statusText =
+            action === "approve"
+                ? `✅ <b>ĐÃ DUYỆT &amp; CỘNG TIỀN</b> (Bởi @${safeAdminUsername})`
+                : `❌ <b>ĐÃ TỪ CHỐI</b> (Bởi @${safeAdminUsername})`;
+
+        const oldText = query.message?.text || "ĐƠN NẠP TIỀN";
+        const safeOldText = escapeHtml(oldText);
+
+        // Xóa nút sau khi xử lý thành công để tránh bấm lại.
+        if (query.message) {
             await bot.editMessageText(
-                `${query.message.text}\n\n━━━━━━━━━━━━━━━━━━\n📌 <b>KẾT QUẢ:</b> ${statusText}`, 
+                `${safeOldText}\n\n━━━━━━━━━━━━━━━━━━\n📌 <b>KẾT QUẢ:</b> ${statusText}`,
                 {
                     chat_id: query.message.chat.id,
                     message_id: query.message.message_id,
                     parse_mode: "HTML",
-                    reply_markup: { inline_keyboard: [] }
+                    reply_markup: {
+                        inline_keyboard: []
+                    }
                 }
             );
         }
-    } catch (error) {
-        console.error("Lỗi duyệt đơn:", error.response ? error.response.data : error.message);
-        
-        const errorMsg = error.response && error.response.data && error.response.data.message
-            ? error.response.data.message
-            : "Lỗi kết nối tới Server Website!";
 
-        bot.answerCallbackQuery(query.id, {
-            text: `⚠️ ${errorMsg}`,
-            show_alert: true
-        });
+        console.log(
+            `✅ Đã ${action === "approve" ? "duyệt" : "từ chối"} đơn ${orderId} bởi ${adminUsername}`
+        );
+    } catch (error) {
+        console.error(
+            "❌ Lỗi xử lý duyệt/từ chối:",
+            error.message
+        );
+
+        try {
+            await bot.answerCallbackQuery(query.id, {
+                text: "⚠️ Lỗi kết nối tới Server Website!",
+                show_alert: true
+            });
+        } catch (_) {}
     }
 });
 
 // ==========================================
-// CÁC COMMAND KHÁC GIỮ NGUYÊN
+// HEALTH CHECK
 // ==========================================
 app.get("/", (req, res) => {
-    res.send("Gia Bao Telegram Bot is running!");
+    res.status(200).send("Gia Bao Telegram Bot is running!");
 });
 
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+app.get("/health", (req, res) => {
+    res.status(200).json({
+        success: true,
+        status: "ok"
+    });
 });
 
-bot.onText(/^\/start$/, (msg) => {
-    bot.sendMessage(
+// ==========================================
+// SERVER
+// ==========================================
+const PORT = Number(process.env.PORT) || 3000;
+
+app.listen(PORT, "0.0.0.0", () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log("🤖 Telegram Bot đang chạy...");
+});
+
+// ==========================================
+// TELEGRAM COMMANDS
+// ==========================================
+bot.onText(/^\/start$/, async (msg) => {
+    await bot.sendMessage(
         msg.chat.id,
         `👋 Chào ${msg.from.first_name || "bạn"}!
 
@@ -166,8 +308,8 @@ bot.onText(/^\/start$/, (msg) => {
     );
 });
 
-bot.onText(/^\/help$/, (msg) => {
-    bot.sendMessage(
+bot.onText(/^\/help$/, async (msg) => {
+    await bot.sendMessage(
         msg.chat.id,
         `📚 TRỢ GIÚP
 
@@ -179,8 +321,8 @@ bot.onText(/^\/help$/, (msg) => {
     );
 });
 
-bot.onText(/^\/menu$/, (msg) => {
-    bot.sendMessage(
+bot.onText(/^\/menu$/, async (msg) => {
+    await bot.sendMessage(
         msg.chat.id,
         `📋 MENU GIA BẢO STORE
 
@@ -192,18 +334,24 @@ bot.onText(/^\/menu$/, (msg) => {
     );
 });
 
-bot.onText(/^\/ping$/, (msg) => {
-    bot.sendMessage(
+bot.onText(/^\/ping$/, async (msg) => {
+    await bot.sendMessage(
         msg.chat.id,
         "🏓 Pong!\n\n✅ Bot đang hoạt động."
     );
 });
 
-bot.onText(/^\/id$/, (msg) => {
-    bot.sendMessage(
+bot.onText(/^\/id$/, async (msg) => {
+    await bot.sendMessage(
         msg.chat.id,
         `🆔 Chat ID: ${msg.chat.id}\n\n👤 User ID: ${msg.from.id}`
     );
 });
 
-console.log("🤖 Telegram Bot đang chạy...");
+bot.on("polling_error", (error) => {
+    console.error("❌ Telegram polling error:", error.message);
+});
+
+bot.on("error", (error) => {
+    console.error("❌ Telegram bot error:", error.message);
+});
