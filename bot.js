@@ -9,7 +9,8 @@ app.use(express.json({ limit: "1mb" }));
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 const INTERNAL_SECRET_TOKEN = process.env.INTERNAL_SECRET_TOKEN;
-const AUTO_APPROVE_SMS = String(process.env.AUTO_APPROVE_SMS || "true").toLowerCase() === "true";
+const AUTO_APPROVE_SMS =
+    String(process.env.AUTO_APPROVE_SMS || "true").toLowerCase() === "true";
 
 if (!BOT_TOKEN) {
     console.error("❌ Thiếu BOT_TOKEN");
@@ -35,6 +36,10 @@ function esc(v) {
         .replace(/'/g, "&#039;");
 }
 
+function money(v) {
+    return Number(v || 0).toLocaleString("vi-VN") + " VNĐ";
+}
+
 app.get("/", (req, res) => {
     res.json({
         ok: true,
@@ -52,8 +57,7 @@ app.get("/health", (req, res) => {
 
 /*
  * Website gọi route này khi tạo đơn.
- * Giữ lại thông báo đơn mới để Admin biết có người đang nạp.
- * Đây KHÔNG phải bước cộng tiền.
+ * Đây chỉ là thông báo "đang chờ thanh toán".
  */
 app.post("/api/create-order", async (req, res) => {
     try {
@@ -70,11 +74,11 @@ app.post("/api/create-order", async (req, res) => {
 `💰 <b>CÓ ĐƠN NẠP TIỀN MỚI</b>
 
 👤 <b>User:</b> ${esc(username)}
-💵 <b>Số tiền:</b> ${Number(amount).toLocaleString("vi-VN")}đ
+💵 <b>Số tiền:</b> ${money(amount)}
 🧾 <b>Mã đơn:</b> <code>${esc(orderId)}</code>
 🏦 <b>Nội dung:</b> <code>${esc(payment_content || "")}</code>
 
-⏳ Chờ khách chuyển khoản...`;
+⏳ <b>Trạng thái:</b> CHỜ THANH TOÁN`;
 
         await bot.sendMessage(ADMIN_CHAT_ID, text, {
             parse_mode: "HTML"
@@ -94,17 +98,16 @@ app.post("/api/create-order", async (req, res) => {
 });
 
 /*
- * sms_webhook.php gọi route này SAU KHI PHP đã:
- * - xác thực X-SMS-Secret
- * - tìm GIABAOSTORE + 8 ký tự
- * - tìm đúng đơn pending
- * - đối chiếu số tiền
- * - chống giao dịch trùng
- * - cộng tiền và chuyển đơn sang approved
+ * sms_webhook.php gọi route này SAU KHI PHP đã xác thực:
+ * - X-SMS-Secret
+ * - mã GIABAOSTORE + 8 ký tự
+ * - đơn pending
+ * - số tiền khớp chính xác
+ * - transaction_id chưa được xử lý
+ * - tài khoản khách tồn tại
  *
- * Route này CHỈ thông báo Telegram.
- * Nó không gọi process_deposit.php nên không gặp trang anti-bot
- * của hosting PHP và không cộng tiền lần thứ hai.
+ * Route này CHỈ gửi thông báo Telegram.
+ * Nó KHÔNG cộng tiền lần nữa.
  */
 app.post("/api/payment-notification", async (req, res) => {
     try {
@@ -117,6 +120,13 @@ app.post("/api/payment-notification", async (req, res) => {
             });
         }
 
+        if (!AUTO_APPROVE_SMS) {
+            return res.status(403).json({
+                success: false,
+                message: "AUTO_APPROVE_SMS đang tắt"
+            });
+        }
+
         const {
             username,
             amount,
@@ -124,7 +134,6 @@ app.post("/api/payment-notification", async (req, res) => {
             payment_content,
             transaction_id,
             sender,
-            sms_message,
             balance_before,
             balance_after
         } = req.body || {};
@@ -137,29 +146,30 @@ app.post("/api/payment-notification", async (req, res) => {
         }
 
         const text =
-`🤖 <b>TỰ ĐỘNG DUYỆT NẠP TIỀN</b>
+`[✅] <b>NẠP TIỀN THÀNH CÔNG</b>
+━━━━━━━━━━━━━━━━━━
+[💵] Số tiền: <b>+${Number(amount).toLocaleString("vi-VN")} VNĐ</b>
+[💳] Mã CK: <code>${esc(payment_content)}</code>
+[🆔] Mã GD: <code>${esc(transaction_id || "Không có")}</code>
+[📝] Ghi chú: Xác nhận tự động qua SMS ngân hàng, không cần bấm Duyệt.
+━━━━━━━━━━━━━━━━━━
+<b>Số dư khách hàng đã được cộng tự động.</b>
 
-👤 <b>User:</b> ${esc(username)}
-💵 <b>Số tiền:</b> ${Number(amount).toLocaleString("vi-VN")}đ
-🧾 <b>Mã đơn:</b> <code>${esc(orderId)}</code>
-🏦 <b>Nội dung CK:</b> <code>${esc(payment_content)}</code>
-🔖 <b>Mã giao dịch:</b> <code>${esc(transaction_id || "Không có")}</code>
-📨 <b>Người gửi:</b> ${esc(sender || "Không rõ")}
-
-💳 <b>Số dư trước:</b> ${Number(balance_before ?? 0).toLocaleString("vi-VN")}đ
-💳 <b>Số dư sau:</b> ${Number(balance_after ?? 0).toLocaleString("vi-VN")}đ
-
-✅ <b>ĐÃ CỘNG TIỀN TỰ ĐỘNG</b>`;
+👤 Tài khoản: <code>${esc(username)}</code>
+💰 Số dư sau: <b>${money(balance_after)}</b>`;
 
         await bot.sendMessage(ADMIN_CHAT_ID, text, {
             parse_mode: "HTML"
         });
 
-        console.log(`✅ AUTO APPROVED: ${orderId} / ${amount}`);
+        console.log(
+            `✅ AUTO APPROVED: ${orderId} / ${amount} / ${payment_content}`
+        );
 
         return res.json({
             success: true,
-            message: "Đã gửi thông báo tự động duyệt"
+            telegram_sent: true,
+            message: "Đã gửi thông báo nạp tiền thành công"
         });
     } catch (error) {
         console.error("❌ /api/payment-notification:", error.message);
@@ -224,12 +234,13 @@ bot.onText(/^\/id$/, (msg) => {
 });
 
 app.listen(Number(process.env.PORT) || 3000, "0.0.0.0", () => {
-    console.log(`🚀 HTTP server listening on 0.0.0.0:${Number(process.env.PORT) || 3000}`);
-    console.log(`🤖 Telegram Bot đang chạy...`);
+    console.log(
+        `🚀 HTTP server listening on 0.0.0.0:${Number(process.env.PORT) || 3000}`
+    );
+    console.log("🤖 Telegram Bot đang chạy...");
     console.log(`🤖 AUTO_APPROVE_SMS=${AUTO_APPROVE_SMS}`);
 });
 
 bot.on("polling_error", (error) => {
     console.error("❌ Telegram polling:", error.message);
 });
-
