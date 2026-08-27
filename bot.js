@@ -64,6 +64,10 @@ function escapeHtml(value) {
 // ==========================================
 app.post("/api/create-order", async (req, res) => {
     try {
+        const incomingToken = req.get("X-Internal-Token") || "";
+        if (incomingToken !== INTERNAL_SECRET_TOKEN) {
+            return res.status(401).json({ success: false, message: "Unauthorized" });
+        }
         const { username, amount, orderId } = req.body || {};
 
         if (
